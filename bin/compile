@@ -69,114 +69,67 @@ create_env() {
   create_default_env
 }
 
-header "Creating runtime environment"
-create_env # can't pipe the whole thing because piping causes subshells, preventing exports
-list_node_config | output "$LOG_FILE"
+# config
+NODE_VERSION="0.4.7"
+NPM_VERSION="1.0.94"
+SCONS_VERSION="1.2.0"
+S3_BUCKET="heroku-buildpack-nodejs"
 
-install_bins() {
-  local node_engine=$(read_json "$BUILD_DIR/package.json" ".engines.node")
-  local iojs_engine=$(read_json "$BUILD_DIR/package.json" ".engines.iojs")
-  local npm_engine=$(read_json "$BUILD_DIR/package.json" ".engines.npm")
-  local yarn_engine=$(read_json "$BUILD_DIR/package.json" ".engines.yarn")
+# parse and derive params
+BUILD_DIR=$1
+CACHE_DIR=$2
+LP_DIR=`cd $(dirname $0); cd ..; pwd`
+CACHE_STORE_DIR=$CACHE_DIR"/node_modules/$NPM_VERSION"
+CACHE_TARGET_DIR=$BUILD_DIR"/node_modules"
 
-  if [ -n "$iojs_engine" ]; then
-    echo "engines.iojs (package.json):  $iojs_engine (iojs)"
-  else
-    echo "engines.node (package.json):  ${node_engine:-unspecified}"
-  fi
-  echo "engines.npm (package.json):   ${npm_engine:-unspecified (use default)}"
-  echo ""
+# s3 packages
+NODE_PACKAGE="http://${S3_BUCKET}.s3.amazonaws.com/nodejs-${NODE_VERSION}.tgz"
+NPM_PACKAGE="http://${S3_BUCKET}.s3.amazonaws.com/npm-${NPM_VERSION}.tgz"
+SCONS_PACKAGE="http://${S3_BUCKET}.s3.amazonaws.com/scons-${SCONS_VERSION}.tgz"
 
-  if [ -n "$iojs_engine" ]; then
-    warn_node_engine "$iojs_engine"
-    install_iojs "$iojs_engine" "$BUILD_DIR/.heroku/node"
-    echo "Using bundled npm version for iojs compatibility: `npm --version`"
-  else
-    warn_node_engine "$node_engine"
-    install_nodejs "$node_engine" "$BUILD_DIR/.heroku/node"
-    install_npm "$npm_engine" "$BUILD_DIR/.heroku/node"
-  fi
-  if $YARN; then
-    install_yarn "$BUILD_DIR/.heroku/yarn" "$yarn_engine"
-  fi
+# vendor directories
+VENDORED_NODE="$(mktmpdir node)"
+VENDORED_NPM="$(mktmpdir npm)"
+VENDORED_SCONS="$(mktmpdir scons)"
 
-  warn_old_npm
-}
+# download and unpack packages
+echo "-----> Fetching Node.js binaries"
+mkdir -p $VENDORED_NODE  && curl $NODE_PACKAGE -s -o -  | tar xzf - -C $VENDORED_NODE
+mkdir -p $VENDORED_NPM   && curl $NPM_PACKAGE -s -o -   | tar xzf - -C $VENDORED_NPM
+mkdir -p $VENDORED_SCONS && curl $SCONS_PACKAGE -s -o - | tar xzf - -C $VENDORED_SCONS
 
-header "Installing binaries"
-install_bins | output "$LOG_FILE"
+# vendor node into the slug
+PATH="$BUILD_DIR/bin:$PATH"
+echo "-----> Vendoring node $NODE_VERSION"
+mkdir -p "$BUILD_DIR/bin"
+cp "$VENDORED_NODE/bin/node" "$BUILD_DIR/bin/node"
 
-restore_cache() {
-  local cache_status="$(get_cache_status)"
+# setting up paths for building
+PATH="$VENDORED_SCONS:$VENDORED_NODE/bin:$PATH"
+INCLUDE_PATH="$VENDORED_NODE/include"
+export CPATH="$INCLUDE_PATH"
+export CPPPATH="$INCLUDE_PATH"
 
-  if $YARN; then
-    if [ -e "$BUILD_DIR/node_modules" ]; then
-      warn "node_modules checked into source control" "https://blog.heroku.com/node-habits-2016#9-only-git-the-important-bits"
-      rm -rf "$BUILD_DIR/node_modules"
-    fi
-  fi
-  if [ "$cache_status" == "valid" ]; then
-    local cache_directories=$(get_cache_directories)
-    if [ "$cache_directories" == "" ]; then
-      echo "Loading 2 from cacheDirectories (default):"
-      restore_cache_directories "$BUILD_DIR" "$CACHE_DIR" "$DEFAULT_CACHE"
-    else
-      echo "Loading $(echo $cache_directories | wc -w | xargs) from cacheDirectories (package.json):"
-      restore_cache_directories "$BUILD_DIR" "$CACHE_DIR" $cache_directories
-    fi
-  else
-    echo "Skipping cache restore ($cache_status)"
-  fi
-}
+# unpack existing cache
+rm -rf $CACHE_TARGET_DIR
+if [ -d $CACHE_STORE_DIR ]; then
+  cp -a $CACHE_STORE_DIR $CACHE_TARGET_DIR
+fi
 
-header "Restoring cache"
-restore_cache | output "$LOG_FILE"
+# install dependencies with npm
+echo "-----> Installing dependencies with npm $NPM_VERSION"
+cd $BUILD_DIR
+HOME="$BUILD_DIR" GIT_DIR=".git" $VENDORED_NODE/bin/node $VENDORED_NPM/cli.js install 2>&1 | indent
+if [ "${PIPESTATUS[*]}" != "0 0" ]; then
+  echo " !     Failed to install dependencies with npm"
+  exit 1
+else
+  echo "       Dependencies installed"
+fi
 
-build_dependencies() {
-  run_if_present 'heroku-prebuild'
-  if $YARN; then
-    yarn_node_modules "$BUILD_DIR"
-  elif $PREBUILD; then
-    echo "Prebuild detected (node_modules already exists)"
-    npm_rebuild "$BUILD_DIR"
-  else
-    npm_node_modules "$BUILD_DIR"
-  fi
-  run_if_present 'heroku-postbuild'
-  # TODO: run_if_present 'build'
-}
-
-header "Building dependencies"
-build_dependencies | output "$LOG_FILE"
-
-cache_build() {
-  local cache_directories=$(get_cache_directories)
-
-  echo "Clearing previous node cache"
-  clear_cache
-  if ! ${NODE_MODULES_CACHE:-true}; then
-    echo "Skipping cache save (disabled by config)"
-  elif [ "$cache_directories" == "" ]; then
-    echo "Saving 2 cacheDirectories (default):"
-    save_cache_directories "$BUILD_DIR" "$CACHE_DIR" "$DEFAULT_CACHE"
-  else
-    echo "Saving $(echo $cache_directories | wc -w | xargs) cacheDirectories (package.json):"
-    save_cache_directories "$BUILD_DIR" "$CACHE_DIR" $cache_directories
-  fi
-  save_signature
-}
-
-header "Caching build"
-cache_build | output "$LOG_FILE"
-
-summarize_build() {
-  if $NODE_VERBOSE; then
-    list_dependencies "$BUILD_DIR"
-  fi
-}
-
-header "Build succeeded!"
-summarize_build | output "$LOG_FILE"
-
-warn_no_start "$LOG_FILE"
-warn_unmet_dep "$LOG_FILE"
+# repack cache with new assets
+if [ -d $CACHE_TARGET_DIR ]; then
+  rm -rf $CACHE_STORE_DIR
+  mkdir -p $(dirname $CACHE_STORE_DIR)
+  cp -a $CACHE_TARGET_DIR $CACHE_STORE_DIR
+fi
